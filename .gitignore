@@ -1,0 +1,4 @@
+runbooks/
+data/raw/
+.DS_Store
+*.bak

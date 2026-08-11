@@ -1,0 +1,701 @@
+# =============================================================================
+# nhtsa_text2sql_german.yaml — MULTILINGUAL RETRIEVAL GAP MEASUREMENT
+#
+#   eval/nhtsa_text2sql.yaml         WITH SemKB, comments in English (treatment)
+#   eval/nhtsa_text2sql_naive.yaml   WITHOUT SemKB                   (control)
+#   eval/nhtsa_text2sql_german.yaml  WITH SemKB, comments in German  <- here
+#
+# -----------------------------------------------------------------------------
+# WHAT THIS MEASURES, AND WHY IT EXISTS
+# -----------------------------------------------------------------------------
+# README.md names two design-partnership asks for Mercedes-Benz. This file turns
+# the first one from a claim into a number:
+#
+#   > Multilingual semantic retrieval. SemKB default embedding model is English.
+#   > Mercedes COMMENT ON text will be German. Measure this before the meeting
+#   > and present the real number, whatever it is. A gap you name yourself is a
+#   > reason to partner; a gap they find is a reason to disengage.
+#
+# The experiment: take eval/nhtsa_text2sql.yaml and change EXACTLY ONE THING —
+# the language of the COMMENT ON text. Identical fixture rows, identical
+# questions (still English), identical ground truth, identical tools, identical
+# instructions, identical models, identical threshold, identical embedding model
+# (`bert`, all-MiniLM-L6-v2, 384 dims, English-only).
+#
+#     score(this file) - score(nhtsa_text2sql.yaml)  ==  the multilingual gap
+#
+# The `tests:` block is byte-identical to the English scenario; verify with:
+#
+#     diff <(awk "/^tests:/,0" eval/nhtsa_text2sql.yaml) \
+#          <(awk "/^tests:/,0" eval/nhtsa_text2sql_german.yaml)
+#
+# Everything about how to run it, the exit codes, the model list, and the
+# "this is NOT the Recall@K / Execution-Accuracy benchmark defined in
+# SemKB_Benchmarking_Framework.md" caveat lives in the header of
+# eval/nhtsa_text2sql.yaml. Read that first.
+#
+# -----------------------------------------------------------------------------
+# success_threshold IS 0.75 — THE SAME AS THE ENGLISH SCENARIO, ON PURPOSE
+# -----------------------------------------------------------------------------
+# It would be easy, and dishonest, to lower this until the suite goes green.
+# Do not. If German scores below 0.75 while English passes, the directory run
+# exits 1 — and THAT FAILING EXIT CODE IS THE FINDING. It is the artefact you
+# carry into the Mercedes conversation. A threshold tuned to hide it converts a
+# credible admission into a discoverable omission.
+#
+# If you need a clean CI gate, point --scenarios at a directory containing only
+# the English scenarios. Do not "fix" this number by editing this line.
+#
+# When the gap closes — bge-m3 as the KB model, or a better multilingual default
+# — this file goes green on its own and no edit is needed. That is the property
+# you want from a threshold.
+# =============================================================================
+
+scenario_name: nhtsa_text2sql_german
+# Byte-identical to eval/nhtsa_text2sql.yaml, verbatim and in English.
+# Translating the instructions too would move a second variable.
+instructions: >-
+  You answer questions about NHTSA vehicle defect data held in PostgreSQL schema
+  "odi_eval". The physical column names are cryptic government identifiers
+  (CMPLID, ODINO, COMPDESC, LDATE, DATEA, FAILDATE, OCCURENCES, POTAFF, ...).
+  You must NEVER infer what a column means from its name.
+
+
+  There is a Semantic Knowledge Base named nhtsa_eval_kb covering schema
+  "odi_eval". Every table and column has been embedded together with its
+  documented description. ALWAYS pass kb_name => 'nhtsa_eval_kb' explicitly to
+  the retrieval tools; other knowledge bases may exist on this database and an
+  omitted kb_name is an ambiguity error.
+
+
+  Procedure for EVERY question:
+
+  STEP 1 - DISCOVER. Call semantic_kb_search with the user question essentially
+  verbatim as query_text. Do not translate it into column names first; that is
+  the mistake this tool exists to prevent. Read relation_name, column_name and
+  comment.
+
+  STEP 2 - DISAMBIGUATE. If two or more columns could plausibly match, retrieve
+  the definition of EACH one with get_column_definitions or search_by_comment
+  and choose based on the comment text, not on the column name and not on your
+  prior knowledge. This dataset has three different date columns that a careless
+  reader would treat as interchangeable. They are not.
+
+  STEP 3 - WRITE ONE QUERY. Only now call run_sql_query, once. Every column is
+  TEXT, including dates, which are YYYYMMDD strings: slice them as text, e.g.
+  substring(ldate FROM 1 FOR 4) = '2023'. Guard numeric casts with a regex test
+  such as CASE WHEN occurences ~ '^[0-9]+$' THEN occurences::bigint ELSE 0 END.
+  run_sql_query is read-only and will reject any write statement.
+
+  STEP 4 - GROUND YOUR ANSWER. State the number, and name the
+  fully-qualified column you relied on and the alternatives you rejected.
+
+
+  If retrieval surfaces no column matching the concept in the question, SAY SO
+  AND STOP. Do not substitute a column that is merely nearby. An honest "the
+  semantic layer has no column for that" is a correct answer; a plausible query
+  over the wrong column is not.
+
+
+tools:
+  - semantic_kb_search
+  - get_entity_definitions
+  - get_column_definitions
+  - search_by_comment
+  - run_sql_query
+
+models:
+  - gpt_5_6_terra_azure_responses
+  - claude_opus_foundry
+  - qwen3.5-0.8b-Q8_0
+
+# Identical to the English scenario. See the banner: do not lower this.
+success_threshold: 0.75
+
+# -----------------------------------------------------------------------------
+# seed_queries: identical to eval/nhtsa_text2sql.yaml EXCEPT the COMMENT ON
+# block, which is German. The DDL, the ten complaint rows, the five recall rows
+# and the create_semantic_kb call are byte-identical, so every ground-truth
+# number in `tests:` below is unchanged.
+# -----------------------------------------------------------------------------
+seed_queries:
+  # --- teardown -------------------------------------------------------------
+  # delete_semantic_kb raises if the KB does not exist, so guard the first run.
+  # All three scenario files use the SAME kb name on purpose: drop-then-create
+  # of one fixed name is guaranteed to leave exactly one KB, which keeps
+  # kb_name-omitting calls unambiguous even if a drop silently no-ops.
+  - |-
+    DO $seed$
+    BEGIN
+        PERFORM aidb.delete_semantic_kb('nhtsa_eval_kb');
+    EXCEPTION WHEN OTHERS THEN
+        NULL;
+    END
+    $seed$
+  - "DROP SCHEMA IF EXISTS odi_eval CASCADE"
+  - "CREATE SCHEMA odi_eval"
+
+  # --- odi_eval.cmpl : consumer complaints ----------------------------------
+  # Column names are the publisher's, verbatim and lowercased. All TEXT, because
+  # the real flat file is dirty and lands as TEXT (see sql/01_schema.sql).
+  - |-
+    CREATE TABLE odi_eval.cmpl (
+        cmplid      TEXT,
+        odino       TEXT,
+        mfr_name    TEXT,
+        maketxt     TEXT,
+        modeltxt    TEXT,
+        yeartxt     TEXT,
+        compdesc    TEXT,
+        faildate    TEXT,
+        ldate       TEXT,
+        datea       TEXT,
+        occurences  TEXT,
+        deaths      TEXT,
+        injured     TEXT,
+        repaired_yn TEXT,
+        cdescr      TEXT
+    )
+  # Ten rows, engineered so the three date columns give THREE DIFFERENT answers
+  # for the same question. If they agreed, the test could not tell a grounded
+  # answer from a lucky one.
+  #
+  #   AIR BAGS complaints in 2023 by LDATE    (filed with NHTSA)  = 3
+  #   AIR BAGS complaints in 2023 by FAILDATE (defect occurred)   = 2
+  #   AIR BAGS complaints in 2023 by DATEA    (added to the file) = 4
+  #
+  #   ALL complaints in 2023 by FAILDATE = 5,  by LDATE = 6,  by DATEA = 7
+  #
+  # Note the opposite pull of tests 1 and 2: one is answered by LDATE, the other
+  # by FAILDATE. A model that simply always reaches for `faildate` (or always
+  # for `datea`) scores 50% on the pair, not 100%. That is intentional.
+  - |-
+    INSERT INTO odi_eval.cmpl
+        (cmplid, odino, mfr_name, maketxt, modeltxt, yeartxt, compdesc,
+         faildate, ldate, datea, occurences, deaths, injured, repaired_yn, cdescr)
+    VALUES
+      ('1001','11001','MERCEDES-BENZ USA LLC','MERCEDES BENZ','C-CLASS','2019','AIR BAGS',
+       '20221118','20230112','20230115','1','0','1','N',
+       'Driver side air bag did not deploy in a low speed frontal collision.'),
+      ('1002','11002','BMW OF NORTH AMERICA LLC','BMW','3-SERIES','2020','AIR BAGS',
+       '20221230','20230210','20230212','2','0','0','Y',
+       'Air bag warning lamp illuminated intermittently on two separate occasions.'),
+      ('1003','11003','FORD MOTOR COMPANY','FORD','F-150','2018','AIR BAGS',
+       '20230317','20230321','20230324','1','0','2','N',
+       'Passenger air bag deployed without impact while driving on the highway.'),
+      ('1004','11004','TOYOTA MOTOR ENGINEERING','TOYOTA','CAMRY','2021','AIR BAGS',
+       '20231228','20240105','20240108','1','0','0','N',
+       'Side curtain air bag failed to deploy during a rollover.'),
+      ('1005','11005','AMERICAN HONDA MOTOR CO','HONDA','CIVIC','2017','SERVICE BRAKES',
+       '20230419','20230425','20230427','3','0','0','Y',
+       'Brake pedal went to the floor three times over a two week period.'),
+      ('1006','11006','MERCEDES-BENZ USA LLC','MERCEDES BENZ','GLC','2022','SERVICE BRAKES',
+       '20220830','20220905','20220908','1','0','0','N',
+       'Grinding noise from the front brakes and extended stopping distance.'),
+      ('1007','11007','BMW OF NORTH AMERICA LLC','BMW','X5','2019','ELECTRICAL SYSTEM',
+       '20230715','20230720','20230722','1','0','0','N',
+       'Complete loss of electrical power while merging onto a motorway.'),
+      ('1008','11008','VOLKSWAGEN GROUP OF AMERICA','VOLKSWAGEN','GOLF','2020','ENGINE',
+       '20240102','20240110','20240112','2','0','0','N',
+       'Engine stalled twice at idle and would not restart for ten minutes.'),
+      ('1009','11009','FORD MOTOR COMPANY','FORD','EXPLORER','2021','AIR BAGS',
+       '20211105','20211112','20230103','1','1','0','N',
+       'Air bag deployed late in a frontal crash.'),
+      ('1010','11010','TOYOTA MOTOR ENGINEERING','TOYOTA','RAV4','2018','ENGINE',
+       '20230601','20230608','20230610','1','0','0','Y',
+       'Excessive oil consumption followed by a check engine warning.')
+
+  # --- odi_eval.rcl : safety recall campaigns -------------------------------
+  # Note `conequence_defect` — the publisher's misspelling of "consequence",
+  # kept verbatim, and `datea` again with a DIFFERENT meaning from cmpl.datea.
+  - |-
+    CREATE TABLE odi_eval.rcl (
+        record_id         TEXT,
+        campno            TEXT,
+        maketxt           TEXT,
+        modeltxt          TEXT,
+        yeartxt           TEXT,
+        compname          TEXT,
+        mfgname           TEXT,
+        rcdate            TEXT,
+        datea             TEXT,
+        potaff            TEXT,
+        desc_defect       TEXT,
+        conequence_defect TEXT
+    )
+  # Five rows, containing TWO deliberate near-misses that punish a sloppy join:
+  #   * TOYOTA RAV4 2018 has a complaint for compdesc 'ENGINE' but a recall for
+  #     compname 'ENGINE AND ENGINE COOLING' — same concept, different string.
+  #   * FORD EXPLORER 2021 has a complaint for AIR BAGS but a recall for
+  #     ELECTRICAL SYSTEM — same vehicle, different component.
+  # Exact component matching therefore yields exactly 3 makes:
+  #   BMW, HONDA, MERCEDES BENZ.
+  - |-
+    INSERT INTO odi_eval.rcl
+        (record_id, campno, maketxt, modeltxt, yeartxt, compname, mfgname,
+         rcdate, datea, potaff, desc_defect, conequence_defect)
+    VALUES
+      ('9001','23V101000','MERCEDES BENZ','C-CLASS','2019','AIR BAGS','MERCEDES-BENZ USA LLC',
+       '20230405','20230410','12500',
+       'The driver air bag inflator may have been assembled with an incorrect propellant.',
+       'An air bag that does not deploy as designed increases the risk of injury.'),
+      ('9002','23V202000','BMW','3-SERIES','2020','AIR BAGS','BMW OF NORTH AMERICA LLC',
+       '20230612','20230615','8300',
+       'The air bag control unit software may misread an occupancy sensor.',
+       'The air bag may not deploy, increasing the risk of injury.'),
+      ('9003','22V303000','HONDA','CIVIC','2017','SERVICE BRAKES','AMERICAN HONDA MOTOR CO',
+       '20220914','20220920','45000',
+       'The brake master cylinder may leak brake fluid internally.',
+       'Reduced braking performance increases the risk of a crash.'),
+      ('9004','23V404000','TOYOTA','RAV4','2018','ENGINE AND ENGINE COOLING','TOYOTA MOTOR ENGINEERING',
+       '20230801','20230805','21000',
+       'The engine oil cooler line may have been improperly crimped.',
+       'An oil leak onto hot surfaces increases the risk of a fire.'),
+      ('9005','21V505000','FORD','EXPLORER','2021','ELECTRICAL SYSTEM','FORD MOTOR COMPANY',
+       '20211201','20211205','9100',
+       'A wiring harness may chafe against the steering column.',
+       'A short circuit may cause a loss of power, increasing the risk of a crash.')
+
+  # --- COMMENT ON : the semantic layer, in German ---------------------------
+  # THIS IS THE ONLY DIFFERENCE from eval/nhtsa_text2sql.yaml. Same fixture, same
+  # questions (still in English), same ground truth, same embedding model, same
+  # tools, same instructions, same threshold — only the language of the
+  # documentation changes. One variable. That is what makes the score delta a
+  # measurement rather than an anecdote.
+  #
+  # Every German comment below is a faithful translation of its English
+  # counterpart, including the disambiguating clauses. Real umlauts and eszett,
+  # not transliterations: a Mercedes schema would have them, and stripping them
+  # would quietly make the test easier than reality.
+  #
+  # The embedding model is still `bert` (all-MiniLM-L6-v2, 384 dims) — ENGLISH
+  # ONLY. That is not a bug in the fixture; it is the gap under measurement, and
+  # it is the first of the two design-partnership asks in README.md.
+  #
+  # >>> THE SECOND DATA POINT, and it is one line: change `model => 'bert'` to
+  #     `model => 'bge-m3-f16'` in the create_semantic_kb call below and re-run.
+  #     bge-m3 is multilingual and pre-registered by CREATE EXTENSION aidb, but
+  #     the ~2.2 GB GGUF downloads on first use — warm it before you need it.
+  #     Report BOTH numbers to Mercedes. The English-model number is the honest
+  #     admission; the bge-m3 number is the honest answer to "so what would you
+  #     do about it".
+  #
+  # >>> A THIRD experiment worth running, but NOT here: translate the `prompt:`
+  #     fields to German as well. That is the realistic end state, but it moves
+  #     two variables at once, so it belongs in its own file with its own
+  #     baseline. Do not conflate it with this measurement.
+  - |-
+    COMMENT ON TABLE odi_eval.cmpl IS
+    'Verbraucherbeschwerden, die beim NHTSA Office of Defects Investigation eingereicht wurden. Eine Zeile je Beschwerde. Es gibt keine gemeinsame Schlüsselspalte mit der Rückruftabelle odi_eval.rcl; verknüpfen Sie beide Tabellen über MAKETXT, MODELTXT und YEARTXT und gleichen Sie COMPDESC in dieser Tabelle mit COMPNAME in jener Tabelle ab.'
+  - |-
+    COMMENT ON TABLE odi_eval.rcl IS
+    'Von der NHTSA veröffentlichte Sicherheitsrückrufaktionen. Eine Zeile je Kampagne und Bauteil. Es gibt keine gemeinsame Schlüsselspalte mit der Beschwerdetabelle odi_eval.cmpl; verknüpfen Sie beide Tabellen über MAKETXT, MODELTXT und YEARTXT und gleichen Sie COMPNAME in dieser Tabelle mit COMPDESC in jener Tabelle ab.'
+  # --- die drei Datumsspalten: die gesamte These dieser Suite ---
+  - |-
+    COMMENT ON COLUMN odi_eval.cmpl.faildate IS
+    'Datum des Vorfalls. Das Datum, an dem der behauptete Mangel oder Ausfall TATSÄCHLICH AM FAHRZEUG AUFGETRETEN IST, wie vom Verbraucher gemeldet. Gespeichert als achtstellige Zeichenkette im Format JJJJMMTT. Dies ist weder das Datum der Beschwerdeeinreichung noch das Datum der Veröffentlichung des Datensatzes.'
+  - |-
+    COMMENT ON COLUMN odi_eval.cmpl.ldate IS
+    'Eingangsdatum der Beschwerde bei der ODI. Das Datum, an dem das NHTSA Office of Defects Investigation die Verbraucherbeschwerde ENTGEGENGENOMMEN UND ERFASST HAT. Gespeichert als achtstellige Zeichenkette im Format JJJJMMTT. Verwenden Sie diese Spalte für jede Frage danach, wann eine Beschwerde eingereicht, übermittelt, gemeldet oder bei der NHTSA erfasst wurde.'
+  - |-
+    COMMENT ON COLUMN odi_eval.cmpl.datea IS
+    'Datum der Aufnahme in die Datei. Das rein administrative Datum, an dem dieser Datensatz an die veröffentlichte Flatfile angehängt wurde. Es spiegelt ausschließlich den Veröffentlichungsprozess der NHTSA wider. Es ist weder das Datum des Vorfalls noch das Datum der Beschwerdeeinreichung und fast nie die richtige Spalte für eine analytische Fragestellung.'
+  - |-
+    COMMENT ON COLUMN odi_eval.rcl.datea IS
+    'Datum der Aufnahme in die Datei für diesen Rückrufdatensatz. Dieselbe rein administrative Bedeutung wie DATEA in der Beschwerdetabelle und ebenso selten die richtige Spalte. Für den Zeitpunkt der Rückrufmeldung verwenden Sie RCDATE.'
+  - |-
+    COMMENT ON COLUMN odi_eval.rcl.rcdate IS
+    'Eingangsdatum der Meldung. Das Datum, an dem die Herstellermeldung zu dieser Rückrufaktion bei der NHTSA eingegangen ist.'
+  # --- Bauteil und die falsch geschriebene Zählspalte ---
+  - |-
+    COMMENT ON COLUMN odi_eval.cmpl.compdesc IS
+    'Bauteilbeschreibung. Das Fahrzeugbauteil oder System, auf das sich die Beschwerde bezieht, als Freitext in Großbuchstaben, zum Beispiel AIR BAGS, SERVICE BRAKES, ELECTRICAL SYSTEM, ENGINE. Die entsprechende Spalte in der Rückruftabelle heißt COMPNAME.'
+  - |-
+    COMMENT ON COLUMN odi_eval.rcl.compname IS
+    'Bauteilname. Das Fahrzeugbauteil oder System, das von dieser Rückrufaktion betroffen ist, als Freitext in Großbuchstaben. Die entsprechende Spalte in der Beschwerdetabelle heißt COMPDESC. Die Vokabulare ähneln sich, sind aber nicht identisch: die Rückruftabelle verwendet längere Bezeichnungen wie ENGINE AND ENGINE COOLING, wo die Beschwerdetabelle ENGINE verwendet.'
+  - |-
+    COMMENT ON COLUMN odi_eval.cmpl.occurences IS
+    'Vorkommnisse. Beachten Sie, dass der Herausgeber diesen Spaltennamen im Englischen mit nur einem r schreibt. Die ANZAHL DER MALE, die der gemeldete Ausfall bei dieser einen Beschwerde aufgetreten ist. Es handelt sich um eine Zählung von Ereignissen innerhalb einer einzelnen Beschwerde, nicht um eine Zählung von Beschwerden. Fragen nach einer Gesamtzahl von Vorkommnissen erfordern daher die SUMME dieser Spalte und nicht die ANZAHL der Zeilen. Als Text gespeichert und möglicherweise leer.'
+  # --- der Rest, damit die Suche echte Konkurrenz zu bewerten hat ---
+  - |-
+    COMMENT ON COLUMN odi_eval.cmpl.cmplid IS
+    'Beschwerdekennung. Eindeutiger Surrogatschlüssel des Beschwerdedatensatzes.'
+  - |-
+    COMMENT ON COLUMN odi_eval.cmpl.odino IS
+    'ODI-Nummer. Die Referenznummer des Office of Defects Investigation zu dieser Beschwerde.'
+  - |-
+    COMMENT ON COLUMN odi_eval.cmpl.maketxt IS
+    'Fahrzeugmarke in Großbuchstaben, zum Beispiel MERCEDES BENZ, BMW, FORD. Verknüpfungsschlüssel zur Rückruftabelle.'
+  - |-
+    COMMENT ON COLUMN odi_eval.cmpl.modeltxt IS
+    'Fahrzeugmodell in Großbuchstaben. Verknüpfungsschlüssel zur Rückruftabelle.'
+  - |-
+    COMMENT ON COLUMN odi_eval.cmpl.yeartxt IS
+    'MODELLJAHR des Fahrzeugs als vierstellige Zeichenkette. Dies ist eine Eigenschaft des Fahrzeugs und kein Datum, an dem etwas geschehen ist; es ist niemals die richtige Spalte für eine Frage danach, wann etwas aufgetreten oder eingereicht wurde.'
+  - |-
+    COMMENT ON COLUMN odi_eval.cmpl.mfr_name IS
+    'Herstellername wie eingereicht. Länger und weniger einheitlich als MAKETXT; für Gruppierungen ist MAKETXT vorzuziehen.'
+  - |-
+    COMMENT ON COLUMN odi_eval.cmpl.deaths IS
+    'Anzahl der in dieser Beschwerde gemeldeten Todesfälle. Als Text gespeichert und möglicherweise leer.'
+  - |-
+    COMMENT ON COLUMN odi_eval.cmpl.injured IS
+    'Anzahl der in dieser Beschwerde gemeldeten verletzten Personen. Als Text gespeichert und möglicherweise leer.'
+  - |-
+    COMMENT ON COLUMN odi_eval.cmpl.repaired_yn IS
+    'Gibt an, ob das Fahrzeug repariert wurde, erfasst als Y oder N. Es handelt sich ausschließlich um ein Kennzeichen. Es enthält KEINERLEI Geldbetrag. In diesem Datensatz gibt es nirgends Reparaturkosten, Gewährleistungskosten, Teilepreise oder Währungswerte.'
+  - |-
+    COMMENT ON COLUMN odi_eval.cmpl.cdescr IS
+    'Beschwerdetext. Freitext des Verbrauchers mit der Schilderung des Vorfalls.'
+  - |-
+    COMMENT ON COLUMN odi_eval.rcl.campno IS
+    'NHTSA-Rückrufkampagnennummer, zum Beispiel 23V101000.'
+  - |-
+    COMMENT ON COLUMN odi_eval.rcl.maketxt IS
+    'Vom Rückruf betroffene Fahrzeugmarke in Großbuchstaben. Verknüpfungsschlüssel zur Beschwerdetabelle.'
+  - |-
+    COMMENT ON COLUMN odi_eval.rcl.modeltxt IS
+    'Vom Rückruf betroffenes Fahrzeugmodell in Großbuchstaben. Verknüpfungsschlüssel zur Beschwerdetabelle.'
+  - |-
+    COMMENT ON COLUMN odi_eval.rcl.yeartxt IS
+    'Vom Rückruf betroffenes Modelljahr des Fahrzeugs als vierstellige Zeichenkette.'
+  - |-
+    COMMENT ON COLUMN odi_eval.rcl.potaff IS
+    'Potenziell betroffen. Die Anzahl der FAHRZEUGEINHEITEN, die potenziell von dieser Rückrufaktion betroffen sind. Es ist eine Fahrzeugbestandszahl, weder eine Anzahl von Beschwerden noch eine Anzahl von Rückrufen.'
+  - |-
+    COMMENT ON COLUMN odi_eval.rcl.conequence_defect IS
+    'Folge des Mangels, wie vom Hersteller beschrieben. Beachten Sie, dass der Herausgeber diesen Spaltennamen im Englischen falsch schreibt und das s in consequence auslässt.'
+  - |-
+    COMMENT ON COLUMN odi_eval.rcl.desc_defect IS
+    'Beschreibung des Mangels, wie vom Hersteller beschrieben.'
+  - |-
+    COMMENT ON COLUMN odi_eval.rcl.mfgname IS
+    'Name des für die Rückrufaktion verantwortlichen Herstellers.'
+  # --- build the KB LAST -----------------------------------------------------
+  # create_semantic_kb crawls and embeds IMMEDIATELY (registry.rs calls
+  # crawl_schemas unconditionally), so the comments above must already exist.
+  # `bert` is pre-registered by CREATE EXTENSION aidb: local, in-process,
+  # 384 dims, no network after the first weight fetch — and ENGLISH ONLY, which
+  # is exactly the variable eval/nhtsa_text2sql_german.yaml isolates.
+  # auto_processing 'Disabled' on purpose: nothing here needs live re-embedding,
+  # and it keeps DDL event triggers out of the seed's way entirely.
+  # vector_index NULL = exact search; ~35 metadata rows make an index pointless.
+  - |-
+    SELECT aidb.create_semantic_kb(
+        name            => 'nhtsa_eval_kb',
+        model           => 'bert',
+        schemas         => ARRAY['odi_eval'],
+        auto_processing => 'Disabled',
+        bypass_triggers => false,
+        vector_index    => NULL
+    )
+
+# =============================================================================
+# tests
+#
+# ⚠️ BYTE-IDENTICAL across all three scenario files (nhtsa_text2sql.yaml,
+#    nhtsa_text2sql_naive.yaml, nhtsa_text2sql_german.yaml). Any edit must be
+#    made in all three or the A/B delta is invalid. Verify with:
+#      diff <(awk "/^tests:/,0" eval/nhtsa_text2sql.yaml) \
+#           <(awk "/^tests:/,0" eval/nhtsa_text2sql_naive.yaml)
+#
+# On `validations:` — these are the objective half of the grade and they run
+# BEFORE the judge is consulted. A false validation forces verdict No (0.0)
+# outright (execution.rs / mod.rs), so the column-choice assertions below are
+# hard gates. Each one must return EXACTLY ONE ROW with ONE BOOLEAN column
+# (db.rs::run_validation uses query_one) — which is why every one of them is a
+# single scalar SELECT over EXISTS(...) / a scalar subquery, never a bare SELECT
+# over a table that might return zero or many rows.
+#
+# Scoping: `aidb_internal.action_log` rows carry no reliable intra-conversation
+# ordering (created_at is transaction time, so every row in one agent_converse
+# shares it, and sequence_id is a UUID). So these assert over the UNION of every
+# run_sql_query issued in the newest conversation, not over "the last one".
+#
+# That makes them deliberately STRICT: an agent that "checks all three date
+# columns" by running three queries FAILS. That is intended. The semantic layer
+# exists so the agent does not have to brute-force the schema, and brute-forcing
+# a date column on a 2.2 million row table is not a behaviour worth rewarding.
+#
+# Word-boundary regex (\m ... \M), not LIKE: 'faildate' CONTAINS the substring
+# 'ldate' (fai + ldate), so `LIKE '%ldate%'` would silently pass the wrong query.
+# =============================================================================
+tests:
+
+  # ---------------------------------------------------------------------------
+  # 1. THE CENTRAL TEST. "Filed" maps to LDATE. Three columns are plausible and
+  #    each gives a different number, so guessing cannot look like knowing.
+  #    Correct: 3.   datea gives 4.   faildate gives 2.
+  # ---------------------------------------------------------------------------
+  - test_name: filed_in_2023_is_ldate_not_datea
+    prompt: >-
+      How many complaints about the airbag were filed with NHTSA during 2023?
+    expected_result: >-
+      The agent answers 3. It states that it used odi_eval.cmpl.ldate, the date
+      the complaint was received and filed by NHTSA, and that it rejected
+      odi_eval.cmpl.datea (the administrative date the record was added to the
+      published file) and odi_eval.cmpl.faildate (the date the defect actually
+      occurred). An answer of 4 or 2, or any answer that does not name the
+      column it used, is wrong even if the reasoning sounds confident.
+    include_action_log: true
+    validations:
+      # 1a. Fixture integrity. If the seed drifted, fail loudly here rather than
+      #     grading every later test against silently wrong ground truth.
+      - |-
+        SELECT (SELECT count(*) FROM odi_eval.cmpl) = 10
+           AND (SELECT count(*) FROM odi_eval.rcl)  = 5
+           AND (SELECT count(*) FROM odi_eval.cmpl
+                 WHERE compdesc = 'AIR BAGS'
+                   AND substring(ldate    FROM 1 FOR 4) = '2023') = 3
+           AND (SELECT count(*) FROM odi_eval.cmpl
+                 WHERE compdesc = 'AIR BAGS'
+                   AND substring(faildate FROM 1 FOR 4) = '2023') = 2
+           AND (SELECT count(*) FROM odi_eval.cmpl
+                 WHERE compdesc = 'AIR BAGS'
+                   AND substring(datea    FROM 1 FOR 4) = '2023') = 4
+      # 1b. Column choice, objectively: LDATE used, neither wrong date column
+      #     touched anywhere in the conversation.
+      - |-
+        WITH latest_conv AS (
+            SELECT conversation_id
+            FROM aidb_internal.agent_task_queue
+            ORDER BY created_at DESC
+            LIMIT 1
+        ), issued AS (
+            SELECT lower(al.request_payload -> 'arguments' ->> 'query') AS sql_text
+            FROM aidb_internal.action_log al
+            JOIN latest_conv lc USING (conversation_id)
+            WHERE al.action_type = 'tool_call'
+              AND al.request_payload ->> 'tool_name' = 'run_sql_query'
+              AND al.request_payload -> 'arguments' ->> 'query' IS NOT NULL
+        )
+        SELECT      EXISTS (SELECT 1 FROM issued WHERE sql_text ~ '\mldate\M')
+           AND NOT  EXISTS (SELECT 1 FROM issued WHERE sql_text ~ '\mdatea\M')
+           AND NOT  EXISTS (SELECT 1 FROM issued WHERE sql_text ~ '\mfaildate\M')
+
+  # ---------------------------------------------------------------------------
+  # 2. The MIRROR of test 1: same three candidate columns, opposite correct
+  #    answer. A model that always reaches for `faildate` passes this and fails
+  #    test 1; a model that always reaches for `datea` fails both.
+  #    Correct: 5.   ldate gives 6.   datea gives 7.
+  # ---------------------------------------------------------------------------
+  - test_name: occurred_in_2023_is_faildate_not_ldate
+    prompt: >-
+      How many complaints describe a defect that actually happened to the
+      vehicle during 2023? Do not count complaints merely filed or published
+      in 2023.
+    expected_result: >-
+      The agent answers 5. It states that it used odi_eval.cmpl.faildate, the
+      date the defect actually occurred, and that it rejected
+      odi_eval.cmpl.ldate (when the complaint was filed with NHTSA) and
+      odi_eval.cmpl.datea (when the record was added to the published file).
+      An answer of 6 or 7 is wrong.
+    include_action_log: true
+    validations:
+      - |-
+        WITH latest_conv AS (
+            SELECT conversation_id
+            FROM aidb_internal.agent_task_queue
+            ORDER BY created_at DESC
+            LIMIT 1
+        ), issued AS (
+            SELECT lower(al.request_payload -> 'arguments' ->> 'query') AS sql_text
+            FROM aidb_internal.action_log al
+            JOIN latest_conv lc USING (conversation_id)
+            WHERE al.action_type = 'tool_call'
+              AND al.request_payload ->> 'tool_name' = 'run_sql_query'
+              AND al.request_payload -> 'arguments' ->> 'query' IS NOT NULL
+        )
+        SELECT      EXISTS (SELECT 1 FROM issued WHERE sql_text ~ '\mfaildate\M')
+           AND NOT  EXISTS (SELECT 1 FROM issued WHERE sql_text ~ '\mldate\M')
+           AND NOT  EXISTS (SELECT 1 FROM issued WHERE sql_text ~ '\mdatea\M')
+
+  # ---------------------------------------------------------------------------
+  # 3. Two traps at once: the publisher's misspelling (`occurences`, one 'r'),
+  #    and count-vs-sum semantics. There are 2 service brakes complaints, but
+  #    4 reported occurrences. COUNT(*) = 2 is the seductive wrong answer.
+  # ---------------------------------------------------------------------------
+  - test_name: occurrences_is_a_sum_not_a_row_count
+    prompt: >-
+      Across all service brakes complaints, what is the total number of reported
+      occurrences of the failure?
+    expected_result: >-
+      The agent answers 4. It uses SUM over odi_eval.cmpl.occurences (spelled
+      with a single r, as the publisher spells it) rather than COUNT of rows,
+      and it explains that occurences counts failure events within a single
+      complaint. An answer of 2 (the row count) is wrong.
+    include_action_log: true
+    validations:
+      - |-
+        SELECT (SELECT sum(occurences::bigint) FROM odi_eval.cmpl
+                 WHERE compdesc = 'SERVICE BRAKES') = 4
+      - |-
+        WITH latest_conv AS (
+            SELECT conversation_id
+            FROM aidb_internal.agent_task_queue
+            ORDER BY created_at DESC
+            LIMIT 1
+        ), issued AS (
+            SELECT lower(al.request_payload -> 'arguments' ->> 'query') AS sql_text
+            FROM aidb_internal.action_log al
+            JOIN latest_conv lc USING (conversation_id)
+            WHERE al.action_type = 'tool_call'
+              AND al.request_payload ->> 'tool_name' = 'run_sql_query'
+              AND al.request_payload -> 'arguments' ->> 'query' IS NOT NULL
+        )
+        SELECT EXISTS (
+            SELECT 1 FROM issued
+            WHERE sql_text ~ '\moccurences\M'
+              AND sql_text ~ '\msum\M'
+        )
+
+  # ---------------------------------------------------------------------------
+  # 4. JOIN CORRECTNESS across cmpl and rcl. The two tables share NO key column
+  #    — the join is (maketxt, modeltxt, yeartxt) plus compdesc <-> compname,
+  #    which is knowledge only the table comments carry. Two near-misses in the
+  #    fixture punish a join that is too loose (dropping the component
+  #    predicate, or joining on make alone, both inflate the answer).
+  #    Correct: 3 — BMW, HONDA, MERCEDES BENZ.
+  # ---------------------------------------------------------------------------
+  - test_name: join_complaints_to_recalls_on_make_model_year_and_component
+    prompt: >-
+      Which vehicle makes have both a consumer complaint and a safety recall for
+      the same component on the same model and model year? List the makes.
+    expected_result: >-
+      The agent lists exactly three makes - BMW, HONDA and MERCEDES BENZ - and
+      no others. It joins odi_eval.cmpl to odi_eval.rcl on maketxt, modeltxt and
+      yeartxt, and matches compdesc against compname. It does not include TOYOTA
+      (whose recall component is ENGINE AND ENGINE COOLING while the complaint
+      component is ENGINE) and does not include FORD (whose 2021 EXPLORER recall
+      is for ELECTRICAL SYSTEM while the complaint is for AIR BAGS). An answer
+      listing four or five makes is wrong.
+    include_action_log: true
+    validations:
+      - |-
+        SELECT (
+            SELECT count(DISTINCT c.maketxt)
+            FROM odi_eval.cmpl c
+            JOIN odi_eval.rcl r
+              ON  c.maketxt  = r.maketxt
+              AND c.modeltxt = r.modeltxt
+              AND c.yeartxt  = r.yeartxt
+              AND c.compdesc = r.compname
+        ) = 3
+      # Objective: the agent actually touched BOTH tables in one statement.
+      - |-
+        WITH latest_conv AS (
+            SELECT conversation_id
+            FROM aidb_internal.agent_task_queue
+            ORDER BY created_at DESC
+            LIMIT 1
+        ), issued AS (
+            SELECT lower(al.request_payload -> 'arguments' ->> 'query') AS sql_text
+            FROM aidb_internal.action_log al
+            JOIN latest_conv lc USING (conversation_id)
+            WHERE al.action_type = 'tool_call'
+              AND al.request_payload ->> 'tool_name' = 'run_sql_query'
+              AND al.request_payload -> 'arguments' ->> 'query' IS NOT NULL
+        )
+        SELECT EXISTS (
+            SELECT 1 FROM issued
+            WHERE sql_text ~ '\mcmpl\M'
+              AND sql_text ~ '\mrcl\M'
+              AND sql_text ~ '\mcompname\M'
+        )
+
+  # ---------------------------------------------------------------------------
+  # 5. CALIBRATION, not accuracy. There is no cost, price or currency column
+  #    anywhere in this dataset, and the comment on repaired_yn says so
+  #    explicitly — so the honest answer is discoverable, not merely absent.
+  #    The correct behaviour is: look, find nothing, say "I cannot determine
+  #    this from this data", and stop.
+  #
+  #    A suite that only measures accuracy rewards a model for always producing
+  #    A number. This test is what stops the scorecard from doing that.
+  #
+  #    Honest limitation: whether the agent SAID "I cannot determine this" is a
+  #    judgement about prose, and validations cannot read the answer text — only
+  #    the database. So the judge carries that half. The validation below carries
+  #    the objective half: it did not invent a monetary column.
+  # ---------------------------------------------------------------------------
+  - test_name: refuses_a_question_the_data_cannot_answer
+    prompt: >-
+      What was the average repair cost, in euros, of the airbag complaints
+      filed during 2023?
+    expected_result: >-
+      The agent states clearly that it CANNOT determine this: the dataset
+      contains no repair cost, price or monetary column of any kind, and it says
+      so rather than producing a number. Naming odi_eval.cmpl.repaired_yn while
+      explaining that it is a Y/N flag carrying no monetary value is correct and
+      good. Producing any euro figure, or silently substituting a count, an
+      occurrence total or a potentially-affected vehicle count as if it answered
+      the question, is WRONG no matter how well hedged.
+    include_action_log: true
+    validations:
+      # No invented monetary column reached the database.
+      - |-
+        WITH latest_conv AS (
+            SELECT conversation_id
+            FROM aidb_internal.agent_task_queue
+            ORDER BY created_at DESC
+            LIMIT 1
+        ), issued AS (
+            SELECT lower(al.request_payload -> 'arguments' ->> 'query') AS sql_text
+            FROM aidb_internal.action_log al
+            JOIN latest_conv lc USING (conversation_id)
+            WHERE al.action_type = 'tool_call'
+              AND al.request_payload ->> 'tool_name' = 'run_sql_query'
+              AND al.request_payload -> 'arguments' ->> 'query' IS NOT NULL
+        )
+        SELECT NOT EXISTS (
+            SELECT 1 FROM issued
+            WHERE sql_text ~ '\m(cost|costs|price|prices|amount|eur|euro|euros|usd|dollar|dollars)\M'
+        )
+
+  # ---------------------------------------------------------------------------
+  # 6. MULTI-TURN. The right column has to survive a follow-up. This is the
+  #    beat in Act 3 of the demo, and it is exactly where a resumed conversation
+  #    can anchor on its own previous answer.
+  #    Correct breakdown of the test-1 answer: BMW 1, FORD 1, MERCEDES BENZ 1.
+  #
+  #    Note the validation scope: the prerequisite and the main prompt share one
+  #    conversation_id, so "no datea anywhere in this conversation" covers both
+  #    turns. That is the assertion we want.
+  # ---------------------------------------------------------------------------
+  - test_name: multi_turn_followup_keeps_the_correct_date_column
+    prerequisite_prompts:
+      - >-
+        How many complaints about the airbag were filed with NHTSA during 2023?
+    on_prerequisite_error: fail
+    prompt: >-
+      Now break that same number down by vehicle make.
+    expected_result: >-
+      The agent reports one complaint each for BMW, FORD and MERCEDES BENZ,
+      totalling 3, and it is still filtering on odi_eval.cmpl.ldate rather than
+      having drifted to datea or faildate between turns. A breakdown totalling
+      4 or 2 means the column changed under the follow-up.
+    include_action_log: true
+    validations:
+      - |-
+        SELECT (
+            SELECT count(DISTINCT maketxt) FROM odi_eval.cmpl
+            WHERE compdesc = 'AIR BAGS'
+              AND substring(ldate FROM 1 FOR 4) = '2023'
+        ) = 3
+      - |-
+        WITH latest_conv AS (
+            SELECT conversation_id
+            FROM aidb_internal.agent_task_queue
+            ORDER BY created_at DESC
+            LIMIT 1
+        ), issued AS (
+            SELECT lower(al.request_payload -> 'arguments' ->> 'query') AS sql_text
+            FROM aidb_internal.action_log al
+            JOIN latest_conv lc USING (conversation_id)
+            WHERE al.action_type = 'tool_call'
+              AND al.request_payload ->> 'tool_name' = 'run_sql_query'
+              AND al.request_payload -> 'arguments' ->> 'query' IS NOT NULL
+        )
+        SELECT      EXISTS (SELECT 1 FROM issued WHERE sql_text ~ '\mldate\M')
+           AND NOT  EXISTS (SELECT 1 FROM issued WHERE sql_text ~ '\mdatea\M')
+           AND NOT  EXISTS (SELECT 1 FROM issued WHERE sql_text ~ '\mfaildate\M')
