@@ -420,8 +420,7 @@ the two-step ladder (`0.5` first, retry once at `0.3`) was replaced with a singl
 `0.3` on every attempt. `0.3` was already documented as the floor below which results turn to
 noise, so starting there directly removes a redundant round-trip with no loss of recall. If a
 `0.3` call still comes back empty or thin, that is a genuine miss — the agent says so rather
-than lowering the threshold further. **Every `RUNBOOK.md` beat that narrates "it retries at
-0.3" needs the same update — there is no retry to narrate anymore, only a single call.**
+than lowering the threshold further. There is no retry to narrate anymore, only a single call.
 <!-- VERIFY discover_context's min_similarity default against your Airman build -->
 
 **3. Every `refresh_kb` instruction stays. This is the important one.**

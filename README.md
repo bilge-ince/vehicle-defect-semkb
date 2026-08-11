@@ -108,15 +108,10 @@ number from one while showing the other.
 ```
 .
 ├── README.md                   ← you are here
-├── runbooks/
-│   ├── SETUP.md                ← full from-scratch environment build
-│   ├── RUNBOOK.md              ← narrated walkthrough, step by step
-│   ├── STEP-BY-STEP.md         ← ordered build phases
-│   └── demo-questions.md       ← example questions to ask the agent
 ├── data/
 │   ├── download.sh             ← fetch NHTSA flat files + data dictionaries
 │   ├── load_nhtsa.py           ← load into Postgres, verify column counts
-│   └── raw/                    ← the published data dictionaries
+│   └── raw/                    ← downloaded dictionaries (created by download.sh)
 ├── scripts/
 │   └── generate_comments.py    ← parse the dictionaries → COMMENT ON statements
 ├── sql/
@@ -145,12 +140,12 @@ number from one while showing the other.
 
 ## Quick start
 
-You need a Postgres with the **AIDB** extension installed. `runbooks/SETUP.md` has the full
-build. `$DSN` below is your database connection string.
+You need a Postgres with the **AIDB** extension installed. `$DSN` below is your database
+connection string.
 
 > **Setup cost, honestly:** there's no container image yet, so standing this up means a
-> pgrx build of the extension — roughly three hours, mostly unattended (`runbooks/SETUP.md`).
-> It's reproducible, just not a one-liner today. A one-command image is the top follow-up.
+> pgrx build of the AIDB extension — roughly three hours, mostly unattended. It's
+> reproducible, just not a one-liner today. A one-command image is the top follow-up.
 
 ```bash
 # 1. Get the data
@@ -171,8 +166,9 @@ psql "$DSN" -f sql/01_schema.sql \
 # 4b. Track B (aidb 7.6.0) — edit the Azure URL in sql/04_agents.sql first, then:
 psql "$DSN" -f sql/04_agents.sql
 
-# 5. Ask it something
-open runbooks/demo-questions.md
+# 5. Ask it something, e.g.:
+#    "Which vehicle components generate the most complaints for 2019 models?"
+#    More worked examples are in langflow/README.md.
 ```
 
 `03_semantic_kb.sql` creates the KB with `auto_processing => 'Live'`, so every later DDL on
