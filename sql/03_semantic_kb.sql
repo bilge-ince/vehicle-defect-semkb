@@ -51,7 +51,8 @@
 -- else in this file changes.
 -- -----------------------------------------------------------------------------
 
-\set kb_model 'bert'
+\set kb_model 'my_embeddings_model'
+-- \set kb_model 'bert'
 -- \set kb_model 'bge-m3-f16'
 
 \set kb_name 'nhtsa_kb'
@@ -80,17 +81,9 @@ SELECT aidb.create_model(
     'openai_embeddings',
     config => '{
         "model": "text-embedding-3-small",
-        "api_key": "<YOUR_AZURE_OPENAI_API_KEY>",
-        "url":     "https://<your-resource>.cognitiveservices.azure.com/openai/v1/embeddings"
-    }'::jsonb
-);
-
-SELECT entity_type, relation_name, column_name, round(score::numeric,4) AS score
-FROM aidb.semantic_kb_search(
-    query_text   => 'the date on which the defect or failure actually occurred in the vehicle',
-    kb_name      => 'nhtsa_kb',
-    top_k        => 5,
-    entity_types => ARRAY['Column']
+        "url": "<URL-replace>"
+    }'::jsonb,
+    credentials_env => 'AIDB_AZURE_OPENAI_API_KEY'
 );
 
 SELECT aidb.create_model(
@@ -98,13 +91,13 @@ SELECT aidb.create_model(
     'openai_responses_azure',
     aidb.openai_responses_config(
         model             => 'gpt-5.4',
-        url               => 'https://<your-resource>.cognitiveservices.azure.com/openai/v1/responses',
+        url               => 'AIDB_AZURE_CHAT_COMPLETIONS_URL',
         temperature       => 0.2,
         max_output_tokens => 2048
     ),
     credentials_env    => 'AIDB_AZURE_OPENAI_API_KEY',
     replace_credentials => true,
-    validate           => true
+    validate           => false
 );
 
 SELECT aidb.create_semantic_kb(
@@ -124,6 +117,7 @@ FROM aidb.semantic_kb_search(
     entity_types => ARRAY['Column']
 );
 
+
 \echo ''
 \echo '-- Model in use:'
 \echo :kb_model
@@ -133,6 +127,7 @@ FROM aidb.semantic_kb_search(
 -- way to hand a psql variable to PL/pgSQL.
 SELECT set_config('demo.kb_model', :'kb_model', false) AS demo_kb_model;
 SELECT set_config('demo.kb_name',  :'kb_name',  false) AS demo_kb_name;
+
 
 
 \echo ''
@@ -342,11 +337,13 @@ FROM aidb.semantic_kb_search(
 --   => NEVER write a bare `LIMIT ${n}` — Postgres will reject a text $1 there.
 -- ---------------------------------------------------------------------------
 
--- NOTE: `model => :'kb_model'` is REQUIRED, not optional. create_semantic_alias
--- only computes description_vector when `model` is passed (aliases.rs:113). An
--- alias created without it is INVISIBLE to
--- aidb.semantic_kb_search(sources => ARRAY['alias']). Same model as the KB, or
--- the vectors are not comparable.
+-- NOTE: the 5th positional argument is `kb_name`, NOT the embedding model
+-- (verified live: aidb.create_semantic_alias(name, description, query_text,
+-- params, kb_name) — passing a model name here fails with "Knowledge base
+-- not found: <model>"). create_semantic_alias only computes description_vector
+-- when kb_name is passed (aliases.rs:113); it looks up that KB's configured
+-- model internally. An alias created without it is INVISIBLE to
+-- aidb.semantic_kb_search(sources => ARRAY['alias']).
 
 \echo ''
 \echo '-- Alias 1 — complaint volume by component for a given model year'
@@ -373,7 +370,7 @@ SELECT aidb.create_semantic_alias(
                          'This is YEARTXT (the model year of the vehicle), '
                          'NOT the year the complaint was filed.')
     ),
-    :'kb_model'
+    :'kb_name'
 ) AS alias_1;
 
 \echo ''
@@ -405,7 +402,7 @@ SELECT aidb.create_semantic_alias(
                          'FAILDATE (when the failure occurred), not DATEA '
                          '(when the record was added to the file).')
     ),
-    :'kb_model'
+    :'kb_name'
 ) AS alias_2;
 
 \echo ''
@@ -432,7 +429,7 @@ SELECT aidb.create_semantic_alias(
                          'Vehicle make as it appears in MAKETXT. Matched '
                          'case-insensitively. Examples: MERCEDES BENZ, BMW, FORD.')
     ),
-    :'kb_model'
+    :'kb_name'
 ) AS alias_3;
 
 

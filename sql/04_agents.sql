@@ -402,20 +402,31 @@ values for the SEPARATE `sources` argument of semantic_kb_search - they are
 never kb_name. Once a tool call succeeds, use its result; do not repeat the same
 call with a different kb_name.
 
-STEP 1 - DISCOVER. Call semantic_kb_search with the user's question,
-essentially verbatim, as query_text. Do not translate it into column names
-first; that is the mistake this tool exists to prevent. Read the returned
-relation_name, column_name and comment fields. Use entity_types to narrow:
+STEP 1 - CHECK FOR A CURATED ANSWER FIRST, BEFORE ANYTHING ELSE. Call
+semantic_kb_search with sources => ARRAY['alias'], using the user's question
+essentially verbatim as query_text. A returned alias is a query a data
+steward has already reviewed and approved. If one clearly matches the
+question's intent, adapt its SQL and go directly to STEP 5 - do NOT perform
+column discovery or disambiguation for a question an alias already answers.
+Checking this first is cheap; discovering and disambiguating columns from
+scratch is not, so skip it whenever an alias covers the question. Only
+continue to STEP 2 if no returned alias is a good match.
+
+STEP 2 - DISCOVER. Call semantic_kb_search with the user's question,
+essentially verbatim, as query_text, and do NOT pass an entity_types filter on
+this first general call - narrowing too early can silently exclude the right
+result. Read the returned relation_name, column_name and comment fields. Only
+on a FOLLOW-UP call, once you know you need to narrow, use entity_types:
 ARRAY['Table','View'] to find the right relation, ARRAY['Column'] to find the
 right attribute.
 
-STEP 2 - NARROW. For every column you are considering using in a WHERE, a
+STEP 3 - NARROW. For every column you are considering using in a WHERE, a
 GROUP BY, or an aggregate, call get_column_definitions with a short phrase
 describing the meaning you need. It returns the full definition text.
 search_by_comment is the sharper instrument when you want to match against the
 documented description rather than the identifier.
 
-STEP 3 - DISAMBIGUATE. This is the rule that matters most.
+STEP 4 - DISAMBIGUATE. This is the rule that matters most.
 IF TWO OR MORE COLUMNS COULD PLAUSIBLY MATCH THE QUESTION, YOU MUST RETRIEVE
 THE DEFINITION OF EACH ONE AND CHOOSE BASED ON THE COMMENT TEXT, NOT ON THE
 COLUMN NAME AND NOT ON YOUR PRIOR KNOWLEDGE. State in your answer which
@@ -423,15 +434,16 @@ alternatives you considered and why you rejected them.
 This dataset has three different date columns that a careless reader would
 treat as interchangeable. They are not. Retrieve all three before you pick one.
 
-STEP 4 - CHECK FOR A CURATED ANSWER. Call semantic_kb_search with
-sources => ARRAY['alias']. A returned alias is a query a data steward has
-already reviewed and approved. Prefer adapting its SQL over inventing your own.
-
 STEP 5 - ONLY NOW WRITE SQL. Call run_sql_query. Every column in schema "odi"
 is TEXT, including dates, which are YYYYMMDD strings - compare and slice them
 as text (substring(faildate FROM 1 FOR 4)) and guard numeric casts with a
 regex test such as: CASE WHEN deaths ~ '^[0-9]+$' THEN deaths::bigint ELSE 0 END.
-run_sql_query is read-only and will reject any write statement.
+NEVER match free text with a regex (cdescr ~* ...) or ILIKE scan over the
+narrative column odi.cmpl.cdescr - that column has no regex-compatible index
+and a live scan over 2.2M rows will be slow or time out. If a question can
+only be answered from the narrative text itself, say so and stop rather than
+attempting an unindexed scan; run_sql_query is read-only and will reject any
+write statement regardless.
 
 STEP 6 - GROUND YOUR ANSWER. Report the fully-qualified name of every column
 you relied on, and set confidence to low if any column you used was chosen

@@ -36,7 +36,8 @@
 -- Must match the model used in sql/03_semantic_kb.sql. Different model =>
 -- different vector space => meaningless distances. sql/05b_hybrid_query.sql
 -- sets the SAME value; if you change it here, change it there too.
-\set kb_model 'bert'
+\set kb_model 'my_embeddings_model'
+-- \set kb_model 'bert'
 -- \set kb_model 'bge-m3-f16'
 
 -- 50k is the number quoted on stage. Drop to 10000 if you are rebuilding
@@ -244,6 +245,8 @@ DECLARE
     v_total      BIGINT;
     v_model      TEXT := current_setting('demo.kb_model');
     v_started    TIMESTAMPTZ := clock_timestamp();
+    v_attempt    INT;
+    v_backoff    NUMERIC;
 BEGIN
     SELECT count(*) INTO v_total FROM odi.cmpl_sample WHERE cdescr_vec IS NULL;
     RAISE NOTICE 'embedding % narratives with model % ...', v_total, v_model;
@@ -263,18 +266,40 @@ BEGIN
 
         EXIT WHEN v_ids IS NULL;
 
-        -- WITH ORDINALITY is what maps each returned vector back to its input
-        -- row: encode_text_batch returns a bare SETOF real[] with no key, and
-        -- yields results in input order.
-        UPDATE odi.cmpl_sample t
-           SET cdescr_vec = e.vec::vector      -- CAST (real[] AS vector) is
-                                               -- provided by pgvector
-          FROM (
-                SELECT vec, ord
-                FROM aidb.encode_text_batch(v_model, v_txt)
-                     WITH ORDINALITY AS x(vec, ord)
-               ) e
-         WHERE t.id = v_ids[e.ord];
+        -- Azure's embedding endpoint rate-limits on tokens/min, not just
+        -- requests/min, and a single batch of 128 x ~4000-char narratives
+        -- can trip it. The whole DO block is one transaction (see the RISK
+        -- note below), so an unhandled error here loses ALL prior progress,
+        -- not just this batch. Retry the SAME batch with backoff instead of
+        -- letting that exception propagate.
+        v_attempt := 0;
+        LOOP
+            v_attempt := v_attempt + 1;
+            BEGIN
+                -- WITH ORDINALITY is what maps each returned vector back to
+                -- its input row: encode_text_batch returns a bare SETOF
+                -- real[] with no key, and yields results in input order.
+                UPDATE odi.cmpl_sample t
+                   SET cdescr_vec = e.vec::vector   -- CAST (real[] AS vector)
+                                                     -- is provided by pgvector
+                  FROM (
+                        SELECT vec, ord
+                        FROM aidb.encode_text_batch(v_model, v_txt)
+                             WITH ORDINALITY AS x(vec, ord)
+                       ) e
+                 WHERE t.id = v_ids[e.ord];
+                EXIT;  -- success, leave the retry loop
+            EXCEPTION WHEN OTHERS THEN
+                IF SQLERRM ILIKE '%rate limit%' AND v_attempt < 8 THEN
+                    v_backoff := LEAST(2 ^ (v_attempt - 1), 30);  -- 1,2,4,...30s cap
+                    RAISE NOTICE '  rate limited on batch at row %, attempt %, backing off %s',
+                        v_done, v_attempt, v_backoff;
+                    PERFORM pg_sleep(v_backoff);
+                ELSE
+                    RAISE;  -- not a rate limit, or out of retries: fail loudly
+                END IF;
+            END;
+        END LOOP;
 
         v_done := v_done + coalesce(array_length(v_ids, 1), 0);
 

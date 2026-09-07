@@ -35,7 +35,8 @@
 -- MUST match the model sql/05a_hybrid_build.sql embedded with, which must in
 -- turn match sql/03_semantic_kb.sql. Different model => different vector space
 -- => meaningless distances.
-\set kb_model 'bert'
+\set kb_model 'my_embeddings_model'
+-- \set kb_model 'bert'
 -- \set kb_model 'bge-m3-f16'
 
 SELECT set_config('demo.kb_model', :'kb_model', false) AS kb_model;
@@ -199,9 +200,18 @@ LIMIT 10;
 \echo '#  STEP 2 — The plan                                        #'
 \echo '############################################################'
 \echo ''
-\echo '-- Point at the Index Scan using cmpl_sample_vec_hnsw and the Bitmap'
-\echo '-- Index Scan on cmpl_sample_tsv_gin in the same plan. One planner, one'
-\echo '-- buffer cache, one transaction, one backup.'
+\echo '-- Point at the Bitmap Index Scan on cmpl_sample_tsv_gin. One planner,'
+\echo '-- one buffer cache, one transaction, one backup.'
+\echo ''
+\echo '-- CAVEAT, verified live: the vec arm shows a Seq Scan here, not an'
+\echo '-- Index Scan on cmpl_sample_vec_hnsw. This pgvector build cannot use'
+\echo '-- the HNSW index when the ORDER BY is combined with another WHERE'
+\echo '-- filter (fire <> ''Y'') in the same scan -- confirmed by re-running'
+\echo '-- with enable_seqscan=off: the seq scan is still chosen, disabled,'
+\echo '-- because no alternative plan exists. At 50k rows this still lands'
+\echo '-- in a few seconds; do not claim on stage that the HNSW index is'
+\echo '-- what makes the vector arm fast here -- a full scan with a cosine'
+\echo '-- distance sort is.'
 \echo ''
 
 EXPLAIN (COSTS OFF, SUMMARY OFF)
