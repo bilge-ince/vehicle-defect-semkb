@@ -26,7 +26,7 @@
 \set ON_ERROR_STOP off
 \timing on
 
-\set kb_name 'nhtsa_kb'
+\set kb_name 'nhtsa_semkb'
 SELECT set_config('demo.kb_name', :'kb_name', false) AS demo_kb_name;
 
 \echo ''
