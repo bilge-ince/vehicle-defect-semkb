@@ -51,11 +51,11 @@
 -- else in this file changes.
 -- -----------------------------------------------------------------------------
 
-\set kb_model 'my_embeddings_model'
+\set kb_model 'bge-small-en-v1.5-f16'
 -- \set kb_model 'bert'
 -- \set kb_model 'bge-m3-f16'
 
-\set kb_name 'nhtsa_kb'
+\set kb_name 'nhtsa_semkb'
 
 -- Idempotent. aidb.create_model uses CREATE FOREIGN TABLE IF NOT EXISTS
 -- internally (sql/aidb--7.5.0--7.6.0.sql), so re-running is a documented no-op.
@@ -76,22 +76,22 @@ SELECT aidb.create_model('bert', 'bert_local', validate => false) AS registered_
 --     validate => false
 -- ) AS registered_model;
 
-SELECT aidb.create_model(
-    'my_embeddings_model',
-    'openai_embeddings',
-    config => '{
-        "model": "text-embedding-3-small",
-        "url": "<URL-replace>"
-    }'::jsonb,
-    credentials_env => 'AIDB_AZURE_OPENAI_API_KEY'
-);
+-- SELECT aidb.create_model(
+--     'my_embeddings_model',
+--     'openai_embeddings',
+--     config => '{
+--         "model": "text-embedding-3-small",
+--         "url": "https://<your-resource>.cognitiveservices.azure.com/openai/v1/embeddings"
+--     }'::jsonb,
+--     credentials_env => 'AIDB_AZURE_OPENAI_API_KEY'
+-- );
 
 SELECT aidb.create_model(
     'nhtsa_chat',
     'openai_responses_azure',
     aidb.openai_responses_config(
-        model             => 'gpt-5.4',
-        url               => 'AIDB_AZURE_CHAT_COMPLETIONS_URL',
+        model             => 'gpt-5.4-mini',
+        url               => 'https://<your-resource>.cognitiveservices.azure.com/openai/v1/responses',
         temperature       => 0.2,
         max_output_tokens => 2048
     ),
@@ -100,23 +100,9 @@ SELECT aidb.create_model(
     validate           => false
 );
 
-SELECT aidb.create_semantic_kb(
-    name            => 'nhtsa_kb',
-    model           => 'my_embeddings_model',
-    schemas         => ARRAY['odi'],
-    auto_processing => 'Live',
-    bypass_triggers => FALSE,
-    vector_index    => NULL
-);
-
-SELECT entity_type, relation_name, column_name, round(score::numeric,4) AS score
-FROM aidb.semantic_kb_search(
-    query_text   => 'the date on which the defect or failure actually occurred in the vehicle',
-    kb_name      => 'nhtsa_kb',
-    top_k        => 5,
-    entity_types => ARRAY['Column']
-);
-
+-- NOTE: the KB is created once, in STEP 3 below (after the idempotent cleanup in
+-- STEP 2). A premature create here would only be dropped and re-embedded, which
+-- doubles the embedding calls to the model for no benefit.
 
 \echo ''
 \echo '-- Model in use:'
@@ -288,236 +274,9 @@ FROM aidb.semantic_kb_search(
 
 \echo ''
 \echo '############################################################'
-\echo '#  STEP 5 — Curated semantic aliases                        #'
-\echo '############################################################'
-\echo ''
-\echo '-- An alias is a named, reviewed, read-only SELECT that an analyst or an'
-\echo '-- agent can FIND by meaning. It is how you stop re-deriving the same'
-\echo '-- three joins, and how a data steward pins the *approved* answer.'
-\echo ''
-
--- ===========================================================================
--- *** TRAILING SEMICOLON — READ THIS BEFORE EDITING ANY query_text BELOW ***
---
--- execute_semantic_alias wraps the stored SQL as `... FROM (<sql>) AS t`
--- (src/pipeline_common/semantic_kb/aliases.rs:execute_semantic_alias). A
--- query_text ending in `;` therefore produced:
---     ERROR:  syntax error at or near ";"
---
--- STATUS ON `main`: FIXED by commit 7db15bcf (AID-4849), which is HEAD of
--- main today. create/update now strip a single trailing `;` + whitespace, and
--- both store and execute run the SQL through
--- validate_single_select_statement() (src/api/sql_command_tags.rs), which uses
--- Postgres's own parser.
---
--- WE STILL WRITE THEM WITHOUT A TRAILING SEMICOLON, deliberately:
---   1. The demo box may be running a packaged 7.6.0 build from *before*
---      7db15bcf. If it is, a trailing `;` fails live.
---   2. Costs nothing.
---
--- The same commit also TIGHTENED what an alias may contain. As of main an
--- alias must be EXACTLY ONE READ-ONLY SELECT. These are all rejected at
--- CREATE time now:
---   - two statements separated by `;`
---   - INSERT / UPDATE / DELETE / MERGE (even with RETURNING)
---   - SELECT ... INTO
---   - SELECT ... FOR UPDATE
---   - a SELECT over a data-modifying CTE
--- Plain read-only CTEs are fine.
--- ===========================================================================
-
--- ---------------------------------------------------------------------------
--- PARAMETER TYPING — the second live landmine.
--- json_value_to_datum() in aliases.rs converts EVERY JSON argument to a TEXT
--- datum (numbers are stringified: `n.to_string().into()`). The declared
--- param_type in aidb.alias_param() is DOCUMENTATION FOR THE AGENT ONLY — it is
--- not enforced and does not drive coercion.
---   => Compare placeholders against TEXT columns (all of odi.* is TEXT), or
---      cast explicitly, e.g. (${n})::int.
---   => NEVER write a bare `LIMIT ${n}` — Postgres will reject a text $1 there.
--- ---------------------------------------------------------------------------
-
--- NOTE: the 5th positional argument is `kb_name`, NOT the embedding model
--- (verified live: aidb.create_semantic_alias(name, description, query_text,
--- params, kb_name) — passing a model name here fails with "Knowledge base
--- not found: <model>"). create_semantic_alias only computes description_vector
--- when kb_name is passed (aliases.rs:113); it looks up that KB's configured
--- model internally. An alias created without it is INVISIBLE to
--- aidb.semantic_kb_search(sources => ARRAY['alias']).
-
-\echo ''
-\echo '-- Alias 1 — complaint volume by component for a given model year'
-SELECT aidb.create_semantic_alias(
-    'nhtsa_complaints_by_component_and_year',
-    'How many consumer complaints were filed against each vehicle component '
-    'for a given model year. Use for questions about which parts or systems '
-    'generate the most complaints in a particular model year.',
-    $sql$
-        SELECT compdesc      AS component,
-               yeartxt       AS model_year,
-               count(*)      AS complaint_count
-        FROM   odi.cmpl
-        WHERE  yeartxt = ${model_year}
-          AND  compdesc IS NOT NULL
-          AND  btrim(compdesc) <> ''
-        GROUP BY compdesc, yeartxt
-        ORDER BY complaint_count DESC
-        LIMIT 25
-    $sql$,
-    aidb.alias_params(
-        aidb.alias_param('model_year', 'string',
-                         'Four-digit vehicle model year as text, e.g. 2019. '
-                         'This is YEARTXT (the model year of the vehicle), '
-                         'NOT the year the complaint was filed.')
-    ),
-    :'kb_name'
-) AS alias_1;
-
-\echo ''
-\echo '-- Alias 2 — fire and crash flagged complaints by manufacturer make'
-SELECT aidb.create_semantic_alias(
-    'nhtsa_fire_and_crash_by_make',
-    'Counts of complaints flagged as involving a vehicle fire or a crash, '
-    'broken down by vehicle make, for incidents occurring on or after a given '
-    'year. Use for thermal event, fire risk, burning or crash severity '
-    'questions across manufacturers.',
-    $sql$
-        SELECT maketxt                                  AS make,
-               count(*) FILTER (WHERE fire  = 'Y')      AS fire_flagged,
-               count(*) FILTER (WHERE crash = 'Y')      AS crash_flagged,
-               count(*)                                 AS total_complaints
-        FROM   odi.cmpl
-        WHERE  faildate ~ '^[0-9]{8}$'
-          AND  substring(faildate FROM 1 FOR 4) >= ${since_year}
-          AND  maketxt IS NOT NULL
-          AND  btrim(maketxt) <> ''
-        GROUP BY maketxt
-        HAVING count(*) FILTER (WHERE fire = 'Y') > 0
-        ORDER BY fire_flagged DESC, total_complaints DESC
-        LIMIT 25
-    $sql$,
-    aidb.alias_params(
-        aidb.alias_param('since_year', 'string',
-                         'Four-digit year as text, e.g. 2015. Filters on '
-                         'FAILDATE (when the failure occurred), not DATEA '
-                         '(when the record was added to the file).')
-    ),
-    :'kb_name'
-) AS alias_2;
-
-\echo ''
-\echo '-- Alias 3 — harm-weighted components for one make'
-SELECT aidb.create_semantic_alias(
-    'nhtsa_harm_weighted_components_for_make',
-    'For a single vehicle make, rank components by reported deaths and '
-    'injuries as well as raw complaint count. Use for safety severity, harm, '
-    'casualty or injury-weighted questions rather than plain complaint volume.',
-    $sql$
-        SELECT compdesc AS component,
-               count(*) AS complaints,
-               sum(CASE WHEN deaths  ~ '^[0-9]+$' THEN deaths::bigint  ELSE 0 END) AS deaths,
-               sum(CASE WHEN injured ~ '^[0-9]+$' THEN injured::bigint ELSE 0 END) AS injuries
-        FROM   odi.cmpl
-        WHERE  maketxt = upper(btrim(${make}))
-          AND  compdesc IS NOT NULL
-        GROUP BY compdesc
-        ORDER BY deaths DESC, injuries DESC, complaints DESC
-        LIMIT 25
-    $sql$,
-    aidb.alias_params(
-        aidb.alias_param('make', 'string',
-                         'Vehicle make as it appears in MAKETXT. Matched '
-                         'case-insensitively. Examples: MERCEDES BENZ, BMW, FORD.')
-    ),
-    :'kb_name'
-) AS alias_3;
-
-
-\echo ''
-\echo '############################################################'
-\echo '#  STEP 6 — Prove the aliases are retrievable and runnable  #'
-\echo '############################################################'
-\echo ''
-\echo '-- 6a. Registered aliases'
-
-SELECT name, param_count, left(description, 70) AS description
-FROM aidb.get_semantic_aliases()
-WHERE name LIKE 'nhtsa\_%'
-ORDER BY name;
-
-\echo ''
-\echo '-- 6b. Alias discovery by MEANING. Note: nobody typed "fire".'
-\echo '--     sources vocabulary is fixed: schema | alias | history | relationship'
-\echo '--     (history and relationship are accepted but return no rows yet).'
-\echo ''
-
-SELECT
-    object_ref,
-    round(score::numeric, 4) AS score,
-    rank,
-    left(definition, 60)     AS definition_excerpt
-FROM aidb.semantic_kb_search(
-    query_text => 'which brands have the most thermal events and burning smells',
-    kb_name    => :'kb_name',
-    top_k      => 5,
-    sources    => ARRAY['alias']
-);
-
-\echo ''
-\echo '-- 6c. One ranked list fusing schema columns AND curated aliases.'
-\echo '--     source_type tells you which came from where.'
-\echo ''
-\echo '--     CAVEAT for the presenter: rrf_k is accepted but is currently a'
-\echo '--     NO-OP. combined_search.rs literally does `let _ = rrf_k;` with the'
-\echo '--     comment "part of the stable signature but only used once Step 2'
-\echo '--     lands". Do not claim reciprocal-rank fusion tuning today.'
-\echo ''
-
-SELECT
-    source_type,
-    entity_type,
-    coalesce(object_ref, relation_name || coalesce('.' || column_name, '')) AS object,
-    round(score::numeric, 4) AS score,
-    rank
-FROM aidb.semantic_kb_search(
-    query_text => 'vehicle fires by manufacturer',
-    kb_name    => :'kb_name',
-    top_k      => 8
-);
-
-\echo ''
-\echo '-- 6d. Execute an alias. Returns SETOF (result JSONB) — one JSON object'
-\echo '--     per row. Expand it client-side, as here.'
-\echo ''
-
-SELECT
-    r.result ->> 'make'              AS make,
-    (r.result ->> 'fire_flagged')::bigint     AS fire_flagged,
-    (r.result ->> 'crash_flagged')::bigint    AS crash_flagged,
-    (r.result ->> 'total_complaints')::bigint AS total_complaints
-FROM aidb.execute_semantic_alias(
-    'nhtsa_fire_and_crash_by_make',
-    '{"since_year": "2015"}'::jsonb
-) AS r
-LIMIT 10;
-
-\echo ''
-\echo '-- 6e. execute_semantic_alias also takes execute_role => ''<role>'', which'
-\echo '--     issues SET LOCAL ROLE before running. That is the hook that ties'
-\echo '--     aliases into the Act 4 RBAC story (see sql/06_governance.sql).'
-\echo '--     Uncomment after 06_governance.sql has created the role.'
-\echo ''
--- SELECT r.result
--- FROM aidb.execute_semantic_alias(
---     'nhtsa_complaints_by_component_and_year',
---     '{"model_year": "2019"}'::jsonb,
---     execute_role => 'nhtsa_defect_analytics'
--- ) AS r
--- LIMIT 5;
-
-\echo ''
-\echo '############################################################'
 \echo '#  03_semantic_kb.sql complete                              #'
+\echo '#  NEXT: sql/03a_relationships.sql  (relationships FIRST),   #'
+\echo '#        then sql/03b_aliases.sql, then sql/04_agents.sql    #'
 \echo '############################################################'
 \echo ''
 \echo '-- NOT AVAILABLE, do not promise it: semantic aliases are deliberately'

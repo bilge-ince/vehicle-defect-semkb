@@ -2,3 +2,6 @@ runbooks/
 data/raw/
 .DS_Store
 *.bak
+
+# local credentials — never commit
+.env
