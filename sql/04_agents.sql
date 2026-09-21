@@ -199,8 +199,9 @@ SELECT aidb.create_model(
         temperature       => 0.2,
         max_output_tokens => 2048
     ),
-    credentials_env => 'AIDB_AZURE_OPENAI_API_KEY',   -- AIDB_ prefix REQUIRED
-    validate        => false
+    credentials_env     => 'AIDB_AZURE_OPENAI_API_KEY',   -- AIDB_ prefix REQUIRED
+    replace_credentials => true,   -- 03 already set the provider creds; reuse/overwrite
+    validate            => false
 ) AS chat_model;
 
 -- ---- THE ACT 6 TARGET: local GGUF, no egress at all -----------------------
@@ -271,7 +272,7 @@ DECLARE
     v_name TEXT;
     v_err  TEXT;
 BEGIN
-    FOREACH v_name IN ARRAY ARRAY['nhtsa_naive', 'nhtsa_semkb'] LOOP
+    FOREACH v_name IN ARRAY ARRAY['nhtsa_naive', 'nhtsa_semkb_agent'] LOOP
         IF EXISTS (SELECT 1 FROM aidb.agents WHERE name = v_name) THEN
             v_err := NULL;
             SELECT error INTO v_err FROM aidb.delete_agent(v_name, force => true);
@@ -323,21 +324,18 @@ BEGIN
         name         => 'nhtsa_naive',
         instructions =>
 $instr$You answer questions about NHTSA vehicle defect data held in PostgreSQL
-schema "odi". Tables: odi.cmpl (consumer complaints), odi.rcl (recalls),
+schema "odi". Tables: odi.cmpl (consumer complaints), odi.rcl (recalls), 
 odi.inv (investigations).
-
 Use the run_sql_query tool to answer. Write standard PostgreSQL SELECT
-statements. Every column in these tables is TEXT, including dates, which are
-stored as YYYYMMDD strings.
-
+statements.
 Answer the user's question directly and state the SQL you used.$instr$,
-        model               => current_setting('demo.chat_model'),
+        model               => 'nhtsa_chat',
         tools               => ARRAY['run_sql_query'],
         max_iterations      => 8,
         timeout             => 120,
         input_token_budget  => 60000,
         output_token_budget => 8000,
-        budget_strategy     => 'attempt_complete'
+        budget_strategy     => 'summarize'
     );
 
     IF v_err IS NULL THEN
@@ -348,10 +346,9 @@ Answer the user's question directly and state the SQL you used.$instr$,
 END
 $mk_naive$;
 
-
 \echo ''
 \echo '############################################################'
-\echo '#  STEP 4 — Agent 2: nhtsa_semkb  (Act 3 payoff)            #'
+\echo '#  STEP 4 — Agent 2: nhtsa_semkb_agent  (Act 3 payoff)      #'
 \echo '############################################################'
 \echo ''
 \echo '-- Same model. Same database. Same permissions. Plus four retrieval'
@@ -380,7 +377,7 @@ DECLARE
     v_err TEXT;
 BEGIN
     SELECT error INTO v_err FROM aidb.create_agent(
-        name         => 'nhtsa_semkb',
+        name         => 'nhtsa_semkb_agent',
         instructions =>
 $instr$You answer questions about NHTSA vehicle defect data held in PostgreSQL
 schema "odi". The physical column names are cryptic government identifiers
@@ -392,25 +389,25 @@ column has been embedded together with its documented description from the
 publisher's own data dictionary. Use it. Follow this procedure on EVERY
 question:
 
-TOOL ARGUMENTS - READ THIS FIRST. The knowledge base is named 'nhtsa_kb' and it
+TOOL ARGUMENTS - READ THIS FIRST. The knowledge base is named 'nhtsa_semkb' and it
 is the only one. WHENEVER a tool accepts a kb_name argument (semantic_kb_search,
 get_column_definitions, get_entity_definitions, search_by_comment), pass
-kb_name => 'nhtsa_kb'. NEVER pass the schema name "odi", a source type such as
+kb_name => 'nhtsa_semkb'. NEVER pass the schema name "odi", a source type such as
 "schema" or "alias", or the word "single" as kb_name; those are NOT
 knowledge-base names and the call will fail. Note that "schema" and "alias" are
 values for the SEPARATE `sources` argument of semantic_kb_search - they are
 never kb_name. Once a tool call succeeds, use its result; do not repeat the same
 call with a different kb_name.
 
-STEP 1 - CHECK FOR A CURATED ANSWER FIRST, BEFORE ANYTHING ELSE. Call
-semantic_kb_search with sources => ARRAY['alias'], using the user's question
-essentially verbatim as query_text. A returned alias is a query a data
-steward has already reviewed and approved. If one clearly matches the
-question's intent, adapt its SQL and go directly to STEP 5 - do NOT perform
-column discovery or disambiguation for a question an alias already answers.
-Checking this first is cheap; discovering and disambiguating columns from
-scratch is not, so skip it whenever an alias covers the question. Only
-continue to STEP 2 if no returned alias is a good match.
+STEP 1 - CHECK FOR A CURATED ANSWER. Call semantic_kb_search with
+sources => ARRAY['alias'], using the user's question essentially verbatim as
+query_text. A returned alias is a query a data steward has reviewed and
+approved. If one FULLY matches the question - same dimension, same filters -
+adapt its SQL and go to STEP 5. But an alias that only PARTIALLY matches (it
+groups by the wrong dimension, or lacks a filter the question needs - e.g. the
+question asks about when a defect OCCURRED but the alias filters on model year)
+is only a HINT: continue to STEP 2, do not force-fit it, and never abandon the
+question just because the nearest alias was imperfect.
 
 STEP 2 - DISCOVER. Call semantic_kb_search with the user's question,
 essentially verbatim, as query_text, and do NOT pass an entity_types filter on
@@ -449,15 +446,17 @@ STEP 6 - GROUND YOUR ANSWER. Report the fully-qualified name of every column
 you relied on, and set confidence to low if any column you used was chosen
 without a retrieved definition backing it.
 
-If retrieval returns nothing relevant, say so and stop. Do not guess. An
-honest "the semantic layer has no column matching that concept" is a correct
-answer; a plausible query over the wrong column is not.$instr$,
+YOUR JOB IS TO PRODUCE AN ANSWER by working these steps. Discovery calls and
+value lookups ARE the work - they are never a reason to stop. Decline ONLY if,
+after you have actually run the discovery, the schema genuinely has no column
+for the concept asked. Never decline merely because a column definition or a
+value spelling needed one more tool call or one more grouped query - make that
+call and answer. "Do not guess" means look it up, not give up: a filter you
+retrieved and grounded is right; a plausible query over the wrong column, or a
+literal value you invented, is wrong.$instr$,
         model  => current_setting('demo.chat_model'),
         tools  => ARRAY[
-            'semantic_kb_search',      -- composite: tables + views + columns + aliases
-            'get_entity_definitions',  -- which relation
-            'get_column_definitions',  -- which attribute, and what it means
-            'search_by_comment',       -- match the documented description
+            'semantic_kb_search',      -- composite: columns + aliases + RELATIONSHIP
             'run_sql_query'            -- and only then, the query
         ],
         -- Structured output. output_field(name, field_type, description);
@@ -470,7 +469,7 @@ answer; a plausible query over the wrong column is not.$instr$,
                 'Direct natural-language answer to the question.'),
             aidb.output_field('sql_used', 'TEXT',
                 'The exact SQL statement that produced the answer.'),
-            aidb.output_field('columns_grounded', 'TEXT[]',
+            aidb.output_field('columns_grounded', 'array',
                 'JSON array of the fully-qualified columns whose definitions '
                 'you actually retrieved from the semantic knowledge base '
                 'before using them, e.g. ["odi.cmpl.faildate"].'),
@@ -530,7 +529,7 @@ SELECT
     output_token_budget,
     budget_strategy,
     (output_type IS NOT NULL) AS structured_output,
-    coalesce(role, '(caller''s role)') AS runs_as
+    coalesce(purpose, '(caller''s role)') AS runs_as
 FROM aidb.agents
 WHERE name IN ('nhtsa_naive', 'nhtsa_semkb')
 ORDER BY name;
@@ -560,7 +559,14 @@ $verify$;
 \echo ''
 
 -- --------------------------------------------------------------------------
--- ACT 1 — the naive agent. Expect a confident, wrong answer built on DATEA.
+-- ACT 1 — the naive agent. THE ACCURACY BEAT (value vocabulary).
+--
+-- OBSERVED (gpt-5.4-mini): naive writes compdesc LIKE '%airbag%' (matches ZERO
+-- rows — NHTSA codes it 'AIR BAGS', plural + spaced) and silently falls back to
+-- scanning the 2.2M-row free-text narrative cdescr, returning ~2830 with full
+-- confidence. But 1530 of those are NOT airbag-component complaints — it is
+-- answering a different, contaminated question and never notices. semkb (ACT 3)
+-- inspects the real values first and returns the grounded 2751.
 -- --------------------------------------------------------------------------
 -- SELECT message, conversation_id, coalesce(error, '(none)') AS error
 -- FROM aidb.agent_converse(
@@ -590,6 +596,59 @@ $verify$;
 -- SELECT message FROM aidb.agent_converse(
 --     'nhtsa_semkb', 'Now break that down by manufacturer.',
 --     conversation_id => :'a_conversation_id');
+
+-- ==========================================================================
+-- ACT 3R — RELATIONSHIPS: the join the schema never declared.
+--
+-- This is the payoff for sql/03a_relationships.sql. The semkb agent has the
+-- join tools (suggest_joins / find_join_path / semantic_kb_subgraph /
+-- list_relationships) and is told to DISCOVER joins, not guess them.
+-- ==========================================================================
+
+-- ---- 3R.a  EASY join: odi.inv -> odi.rcl on CAMPNO -----------------------
+-- CAMPNO is spelled IDENTICALLY in both tables, so a strong model can GUESS
+-- this one even without the semantic layer. Run it to show they AGREE — then
+-- move to 3R.b, where the naive agent falls apart. Verified live: the semkb
+-- agent calls suggest_joins('odi.inv','odi.rcl') and grounds on
+-- odi.inv.campno = odi.rcl.campno.
+-- SELECT message FROM aidb.agent_converse('nhtsa_naive',
+--   'Which vehicle safety investigations led to a recall campaign, and for what '
+--   'component? Give the top components by number of resulting recalls.');
+-- SELECT message FROM aidb.agent_converse('nhtsa_semkb',
+--   'Which vehicle safety investigations led to a recall campaign, and for what '
+--   'component? Give the top components by number of resulting recalls.') \gset r_
+-- SELECT :'r_message'::jsonb ->> 'answer'  AS answer,
+--        :'r_message'::jsonb ->> 'sql_used' AS sql_used;
+
+-- ---- 3R.b  HARD join: odi.cmpl -> odi.inv on (make/model/year) ------------
+-- THE ONE THAT SEPARATES THEM. The vehicle-identity columns are named
+-- DIFFERENTLY on each side: cmpl.maketxt/modeltxt/yeartxt vs inv.make/model/
+-- year. There is no identical column name to guess from, and mfr_name/odino
+-- are plausible-but-wrong alternatives.
+--
+-- The reliable difference (agent_converse is a stochastic ReAct loop, so any
+-- single run varies — do NOT promise a fixed transcript):
+--   * nhtsa_naive must REDISCOVER the join by trial and error each run. It has
+--     no foreign key and no curated relationship, so it probes column names
+--     (often guessing non-existent ones like c.model / i.model_year first),
+--     and the join it lands on is unverified — in one observed gpt-5.4 run it
+--     invented an inconsistent join (added mfr_name, dropped maketxt=make) and
+--     exhausted its 8-iteration budget before answering.
+--   * nhtsa_semkb calls suggest_joins('odi.cmpl','odi.inv') and uses the
+--     curated predicate c.maketxt=i.make AND c.modeltxt=i.model AND c.yeartxt=
+--     i.year — the same, grounded, auditable answer every run, in one tool call.
+-- SELECT message, coalesce(error,'(none)') AS error FROM aidb.agent_converse('nhtsa_naive',
+--   'For Mercedes-Benz vehicles, which model and model year that consumers filed '
+--   'complaints about were also the subject of an ODI safety investigation? Show '
+--   'the number of complaints per model and year, and the investigation subject.');
+-- SELECT message FROM aidb.agent_converse('nhtsa_semkb',
+--   'For Mercedes-Benz vehicles, which model and model year that consumers filed '
+--   'complaints about were also the subject of an ODI safety investigation? Show '
+--   'the number of complaints per model and year, and the investigation subject.') \gset r2_
+-- SELECT :'r2_message'::jsonb ->> 'answer'           AS answer,
+--        :'r2_message'::jsonb ->> 'sql_used'         AS sql_used,
+--        :'r2_message'::jsonb ->  'columns_grounded' AS columns_grounded,
+--        :'r2_message'::jsonb ->> 'confidence'       AS confidence;
 
 -- --------------------------------------------------------------------------
 -- ACT 4 — the read-only guardrail.
